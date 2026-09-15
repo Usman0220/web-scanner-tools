@@ -50,6 +50,23 @@ type Result struct {
 	Title      string
 }
 
+// ANSI color helpers
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorCyan   = "\033[36m"
+	colorBold   = "\033[1m"
+)
+
+func red(s string) string   { return colorRed + s + colorReset }
+func green(s string) string { return colorGreen + s + colorReset }
+func yellow(s string) string { return colorYellow + s + colorReset }
+func cyan(s string) string  { return colorCyan + s + colorReset }
+func bold(s string) string  { return colorBold + s + colorReset }
+
 type scanner struct {
 	ports    []int
 	timeout  time.Duration
@@ -189,7 +206,7 @@ Options:
 		}
 	case *localF:
 		if *exhaustF {
-			fmt.Println("🔍 Exhaustive local scan: enumerating all IPs of the enabled class ranges")
+			fmt.Printf("%s\n", cyan("🔍 Exhaustive local scan: enumerating all IPs of the enabled class ranges"))
 		} else {
 			if randomCount == 0 {
 				randomCount = *countF
@@ -197,10 +214,10 @@ Options:
 					randomCount = 99999
 				}
 			}
-			fmt.Printf("🎯 Random local scan mode: %d IPs\n", randomCount)
+			fmt.Printf("%s\n", green("🎯 Random local scan mode: "+strconv.Itoa(randomCount)+" IPs"))
 		}
-		fmt.Printf("📋 Ranges: A(10/8)=%t B(172.16/12)=%t C(192.168/16)=%t\n", scanClassA, scanClassB, scanClassC)
-		fmt.Println("======================================")
+		fmt.Printf("📋 %s\n", cyan(fmt.Sprintf("Ranges: A(10/8)=%t B(172.16/12)=%t C(192.168/16)=%t", scanClassA, scanClassB, scanClassC)))
+		fmt.Println(bold("======================================"))
 		if *exhaustF {
 			ips = enumerateLocalIPs()
 		} else {
@@ -213,8 +230,8 @@ Options:
 				randomCount = 99999
 			}
 		}
-		fmt.Printf("🎯 Random IP scan mode: %d IPs\n", randomCount)
-		fmt.Println("======================================")
+		fmt.Printf("%s\n", green("🎯 Random IP scan mode: "+strconv.Itoa(randomCount)+" IPs"))
+		fmt.Println(bold("======================================"))
 		ips = generateRandomIPs(randomCount)
 	}
 	if len(ips) == 0 {
@@ -258,7 +275,7 @@ Options:
 		header := fmt.Sprintf("Web Port Scanner Results - %s\nTargets: %d IPs | Ports: %v\n%s\n\n",
 			time.Now().Format("2006-01-02 15:04:05"), len(ips), ports, strings.Repeat("=", 60))
 		file.WriteString(header)
-		fmt.Printf("📄 Results will be saved to: %s\n\n", outPath)
+		fmt.Printf("📄 %s\n\n", cyan("Results will be saved to: "+outPath))
 	}
 
 	// HTTP client for banner probing
@@ -303,7 +320,7 @@ Options:
 				} else {
 					httpxCmd = cmd
 					streamHTTPX = true
-					fmt.Printf("🔎 Streaming open ports to httpx (%s) as they are found...\n", httpxBin)
+					fmt.Printf("%s\n", cyan(fmt.Sprintf("🔎 Streaming open ports to httpx (%s) as they are found...", httpxBin)))
 				}
 			}
 		}
@@ -320,11 +337,11 @@ Options:
 		for r := range s.results {
 			if s.skipCloud && matchesCloud(r) {
 				skipped++
-				fmt.Printf("⛔ [SKIP cloud] %s:%d server=%q\n", r.Target, r.Port, r.Server)
+				fmt.Printf("%s %s:%d server=%q\n", yellow("⛔ [SKIP cloud]"), r.Target, r.Port, r.Server)
 				continue
 			}
 			line := r.String()
-			fmt.Println(line)
+			fmt.Println(strings.Replace(line, "[OPEN]", green("[OPEN]"), 1))
 			if s.file != nil {
 				s.fileMu.Lock()
 				s.file.WriteString(line + "\n")
@@ -342,7 +359,7 @@ Options:
 		}
 	}()
 
-	fmt.Printf("🔍 Scanning %d IPs on %d web ports (%d workers)...\n", len(ips), len(ports), s.workers)
+	fmt.Printf("%s\n", bold(cyan(fmt.Sprintf("🔍 Scanning %d IPs on %d web ports (%d workers)...", len(ips), len(ports), s.workers))))
 
 	// Progress ticker
 	progStop := make(chan struct{})
@@ -388,8 +405,7 @@ scanLoop:
 		s.file.WriteString(footer)
 		s.file.Close()
 	}
-	fmt.Printf("\n✅ Scan complete! %d open web ports found across %d IPs (%d skipped as cloud/CDN). Results in %s\n",
-		s.open, len(ips), skipped, outPath)
+	fmt.Printf("\n%s\n", green(fmt.Sprintf("✅ Scan complete! %d open web ports found across %d IPs (%d skipped as cloud/CDN). Results in %s", s.open, len(ips), skipped, outPath)))
 
 	// Write the collected URL list for later use
 	if len(urls) > 0 {
@@ -397,7 +413,7 @@ scanLoop:
 		if err := os.WriteFile(urlFile, []byte(strings.Join(urls, "\n")+"\n"), 0644); err != nil {
 			fmt.Printf("⚠️  Could not write URL list: %v\n", err)
 		} else {
-			fmt.Printf("🌐 URL list saved: %s (%d URLs)\n", urlFile, len(urls))
+			fmt.Printf("%s\n", cyan(fmt.Sprintf("🌐 URL list saved: %s (%d URLs)", urlFile, len(urls))))
 		}
 	}
 }
@@ -506,10 +522,12 @@ func (r Result) URLs() []string {
 }
 
 func (r Result) String() string {
+	urls := r.URLs()
 	var parts []string
-	parts = append(parts, fmt.Sprintf("[OPEN] %s:%d", r.Target, r.Port))
-	if r.Scheme != "" {
-		parts = append(parts, r.Scheme)
+	if len(urls) == 1 {
+		parts = append(parts, fmt.Sprintf("[OPEN] %s", urls[0]))
+	} else {
+		parts = append(parts, fmt.Sprintf("[OPEN] %s", urls[0]), urls[1])
 	}
 	if r.StatusCode != 0 {
 		parts = append(parts, fmt.Sprintf("status=%d", r.StatusCode))
@@ -589,7 +607,7 @@ func (s *scanner) progressOnce() {
 	}
 	s.lastTick = time.Now()
 	if s.scanned > 0 {
-		fmt.Printf("⏳ Progress: %d connection attempts, %d open ports\n", s.scanned, s.open)
+		fmt.Printf("%s\n", yellow(fmt.Sprintf("⏳ Progress: %d connection attempts, %d open ports", s.scanned, s.open)))
 	}
 }
 
