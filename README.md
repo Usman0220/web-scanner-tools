@@ -80,6 +80,46 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 
 ---
 
+### 🌐 **Web Port Scanner** (`webport-scanner.go`)
+*Find open web (HTTP/HTTPS) ports quickly*
+
+- 🎯 **Targets**: single IP/host, CIDR (`10.0.0.0/24`), IP range, hosts, or a targets file
+- 🏠 **Local Mode**: `-local` scans private Class A (10/8), B (172.16/12), C (192.168/16) ranges, incl. `-exhaust` full enumeration
+- 🎲 **Random IPs**: default 99,999 random IPs from internet blocks when no target is given; `-blocks` and `-count` control them
+- ⚙️ **Custom Ports**: `-ports` flag with ranges (`-ports 80,443,8000-8100`)
+- 🏎️ **Concurrent**: worker pool with tunable `-workers` and `-timeout`
+- 🔍 **Banner Probe**: `-banner` reports scheme, status, server and page title
+- 💾 **Real-time Logging**: timestamped results file
+
+**Usage Examples:**
+```bash
+# Default web ports on a host
+./webport-scanner example.com
+
+# No target given: scan 99,999 random internet IPs (same as the other scanners)
+./webport-scanner
+
+# Random scan of private ranges (all Class A/B/C)
+./webport-scanner -local
+
+# Class C only, 65,536 random IPs
+./webport-scanner -local -a=false -b=false -count 65536
+
+# Enumerate every IP of the private ranges
+./webport-scanner -local -exhaust
+
+# Custom ports with banner probing
+./webport-scanner -ports 80,443,8080-8100 -banner example.com
+
+# Scan a subnet
+./webport-scanner 192.168.1.0/24
+
+# Scan targets from a file
+./webport-scanner -file targets.txt
+```
+
+---
+
 ### 🎮 **Main Scanner** (`main.go`)
 *The orchestrator that brings it all together*
 
@@ -108,6 +148,7 @@ go build -o aspx-scanner.exe aspx-login-optimized.go
 go build -o php-scanner.exe php-login-optimized.go
 go build -o speedy.exe speedy.go
 go build -o sql-scanner.exe sql-vuln-finder.go
+go build -o webport-scanner webport-scanner.go
 
 # Or build them all at once (Windows PowerShell)
 Get-ChildItem *.go | ForEach-Object { go build -o ($_.BaseName + ".exe") $_.Name }
