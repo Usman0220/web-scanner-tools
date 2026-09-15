@@ -145,6 +145,9 @@ type Result struct {
 	Score      int      // 0-100 juice ranking
 	Tags       []string // interesting-finding tags
 	PathHits   string   // compact list of juicy path hits e.g. /admin(200)
+	RootOK     bool     // root probe answered real HTTP
+	RealHits   int      // number of juicy paths that returned 200
+	Protected  bool     // only protected (403/401/302) hits, no real content
 }
 
 // ANSI color helpers
@@ -171,9 +174,10 @@ type scanner struct {
 	probe           bool
 	skipCloud       bool
 	forceProbe      bool
-	juice           bool
-	minScore        int
-	customPaths     []string
+juice          bool
+	minScore       int
+	keepProtected  bool
+	customPaths    []string
 	statusMatch     func(int) bool
 	client          *http.Client
 	ctx             context.Context
@@ -236,6 +240,7 @@ func main() {
 		topJuicyF   = flag.Int("top", 15, "how many top juicy hosts to print in the final summary")
 		openF       = flag.Int("open", 0, "auto-open juicy targets in a running browser IMMEDIATELY as they are found (max tabs; 0 = off)")
 		openScoreF  = flag.Int("open-score", 30, "minimum juice score for a host to be auto-opened in the browser")
+		keepProtF   = flag.Bool("keep-protected", false, "keep hosts whose ONLY signal is 403/401/302 protected hits (default: drop them as noise)")
 		browserF    = flag.String("browser", "", "browser executable to open targets with (default: auto-detect a running browser: brave, chrome, chromium, edge, firefox...)")
 	)
 	flag.Usage = func() {
@@ -452,6 +457,7 @@ Options:
 		skipCloud:        *skipCloudF,
 		juice:            *juiceF,
 		minScore:         *minScoreF,
+		keepProtected:    *keepProtF,
 		customPaths:      parsePathsFlag(*pathsF),
 		statusMatch:      statusMatch,
 		file:             file,
@@ -567,6 +573,11 @@ Options:
 			}
 			// -xmc excluded status filter (default 403)
 			if excludeCodes[r.StatusCode] {
+				filtered++
+				continue
+			}
+			// Protected shells: no real content, every signal was 403/401/302
+			if r.Protected && !s.keepProtected {
 				filtered++
 				continue
 			}
@@ -806,6 +817,7 @@ func (s *scanner) probeBanner(ip string, port int) Result {
 		return r
 	}
 	defer resp.Body.Close()
+	r.RootOK = true
 
 	r.Scheme = scheme
 	r.StatusCode = resp.StatusCode
@@ -889,9 +901,11 @@ func (s *scanner) assessJuice(r *Result) {
 	}
 
 	// Path probing - only when we actually talked HTTP(S)
+	realHits := 0
 	if r.Scheme != "" {
-		s.probeJuicyPaths(r, &score, &tags, &add)
+		s.probeJuicyPaths(r, &score, &tags, &add, &realHits)
 	}
+	r.RealHits = realHits
 
 	// Dedupe tags, cap at 100
 	seen := make(map[string]bool)
@@ -903,6 +917,8 @@ func (s *scanner) assessJuice(r *Result) {
 		}
 	}
 	tags = clean
+	// Protected shell: nothing answered with real content, every hit was 403/401/302
+	r.Protected = !r.RootOK && realHits == 0 && r.PathHits != ""
 	if score > 100 {
 		score = 100
 	}
@@ -911,7 +927,7 @@ func (s *scanner) assessJuice(r *Result) {
 }
 
 // probeJuicyPaths issues lightweight GETs against juicy paths
-func (s *scanner) probeJuicyPaths(r *Result, score *int, tags *[]string, add *func(int, string)) {
+func (s *scanner) probeJuicyPaths(r *Result, score *int, tags *[]string, add *func(int, string), realHits *int) {
 	base := fmt.Sprintf("%s://%s", r.Scheme, net.JoinHostPort(r.Target, strconv.Itoa(r.Port)))
 	paths := juicyPaths
 	for _, p := range s.customPaths {
@@ -937,6 +953,7 @@ func (s *scanner) probeJuicyPaths(r *Result, score *int, tags *[]string, add *fu
 		switch {
 		case status == 200: // hard hit
 			(*add)(pc.Weight, pc.Name)
+			(*realHits)++
 			hit = true
 		case pc.Admin && !pc.Secret && (status == 401 || status == 403 || status == 302):
 			(*add)(maxInt(pc.Weight-8, 5), pc.Name+":protected")
