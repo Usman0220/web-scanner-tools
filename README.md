@@ -89,6 +89,7 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 - ⚙️ **Custom Ports**: `-ports` flag with ranges (`-ports 80,443,8000-8100`)
 - 🏎️ **Concurrent**: worker pool with tunable `-workers` and `-timeout`
 - 🔍 **Banner Probe**: `-banner` reports scheme, status, server and page title
+- 🔗 **httpx Integration**: found URLs are written to `<out>.urls` and piped into [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) by default (auto-detects `httpx`/`httpx-pd`/`httpx-toolkit`, skips the Python httpx client). Tune with `-httpx` and `-httpx-opts`
 - 💾 **Real-time Logging**: timestamped results file
 
 **Usage Examples:**
@@ -116,6 +117,9 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 
 # Scan targets from a file
 ./webport-scanner -file targets.txt
+
+# Pipe discovered ports into projectdiscovery httpx probes
+./webport-scanner -local -httpx auto -httpx-opts "-status-code -title -tech-detect -web-server"
 ```
 
 ---

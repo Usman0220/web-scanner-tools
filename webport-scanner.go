@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,8 @@ func main() {
 		progressF   = flag.Int("progress", 2, "progress report interval in seconds")
 		maxIdleF    = flag.Int("max-idle", 500, "max idle connections for the banner HTTP client")
 		headerTF    = flag.Duration("banner-timeout", 3*time.Second, "response header timeout for banner probing")
+		httpxF      = flag.String("httpx", "auto", "pipe found URLs to projectdiscovery httpx ('auto' to detect, binary name/path, or 'off')")
+		httpxOptsF  = flag.String("httpx-opts", "-status-code -title -tech-detect -web-server", "extra flags passed to projectdiscovery httpx")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Web Port Scanner
@@ -95,6 +98,8 @@ Targets can be a single IP or hostname, CIDR block, IP range, or a
 comma-separated list of any of the above.
 
 All settings are changeable via flags (use -help to list them).
+Found URLs are written to <out>.urls and piped to projectdiscovery
+httpx by default (-httpx off to disable).
 
 Options:
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
@@ -242,8 +247,10 @@ Options:
 		},
 	}
 
-	// Result writer
+	// Result writer + URL collector
 	var resultWg sync.WaitGroup
+	var urls []string
+	var urlsMu sync.Mutex
 	resultWg.Add(1)
 	go func() {
 		defer resultWg.Done()
@@ -255,6 +262,11 @@ Options:
 				s.file.WriteString(line + "\n")
 				s.file.Sync()
 				s.fileMu.Unlock()
+			}
+			for _, u := range r.URLs() {
+				urlsMu.Lock()
+				urls = append(urls, u)
+				urlsMu.Unlock()
 			}
 		}
 	}()
@@ -298,6 +310,31 @@ scanLoop:
 		s.file.Close()
 	}
 	fmt.Printf("\n✅ Scan complete! %d open web ports found across %d IPs. Results in %s\n", s.open, len(ips), outPath)
+
+	// Write URL list for httpx and optionally run projectdiscovery httpx
+	if len(urls) > 0 {
+		urlFile := outPath + ".urls"
+		if err := os.WriteFile(urlFile, []byte(strings.Join(urls, "\n")+"\n"), 0644); err != nil {
+			fmt.Printf("⚠️  Could not write URL list: %v\n", err)
+		} else {
+			fmt.Printf("🌐 URL list for httpx: %s (%d URLs)\n", urlFile, len(urls))
+		}
+
+		httpxBin := strings.ToLower(*httpxF)
+		if httpxBin != "off" && httpxBin != "false" {
+			if httpxBin == "auto" || httpxBin == "true" {
+				httpxBin = findPDHTTPX()
+			}
+			if httpxBin == "" {
+				fmt.Println("⚠️  ProjectDiscovery httpx not found in PATH; skipped. Use the .urls file or install httpx (github.com/projectdiscovery/httpx).")
+			} else {
+				fmt.Printf("🔎 Running httpx (%s) on %d URLs...\n", httpxBin, len(urls))
+				runHTTPX(httpxBin, urls, *httpxOptsF)
+			}
+		}
+	} else {
+		fmt.Println("ℹ️  No open ports found, nothing to hand to httpx.")
+	}
 }
 
 type scanJob struct {
@@ -384,6 +421,24 @@ func extractTitle(content string) string {
 	return strings.TrimSpace(body[start : start+end])
 }
 
+// URLs returns the URL(s) to probe for this open port. If the scheme is
+// unknown (no banner probe), both https and http variants are emitted so
+// httpx can determine which one answers.
+func (r Result) URLs() []string {
+	host := net.JoinHostPort(r.Target, strconv.Itoa(r.Port))
+	switch r.Scheme {
+	case "https":
+		return []string{fmt.Sprintf("https://%s", host)}
+	case "http":
+		return []string{fmt.Sprintf("http://%s", host)}
+	default:
+		return []string{
+			fmt.Sprintf("https://%s", host),
+			fmt.Sprintf("http://%s", host),
+		}
+	}
+}
+
 func (r Result) String() string {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("[OPEN] %s:%d", r.Target, r.Port))
@@ -400,6 +455,60 @@ func (r Result) String() string {
 		parts = append(parts, fmt.Sprintf("title=%q", r.Title))
 	}
 	return strings.Join(parts, " | ")
+}
+
+// findPDHTTPX locates the projectdiscovery httpx binary, skipping any
+// Python HTTPX client that may shadow it in PATH.
+func findPDHTTPX() string {
+	candidates := []string{"httpx", "httpx-pd", "httpx-toolkit", "httpx2"}
+	for _, c := range candidates {
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		if isPythonScript(p) {
+			continue
+		}
+		return c
+	}
+	return ""
+}
+
+// isPythonScript reports whether the given executable is a python script
+// (i.e. the httpx python client, which shadows projectdiscovery's httpx).
+func isPythonScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 256)
+	n, _ := f.Read(buf)
+	return strings.Contains(strings.ToLower(string(buf[:n])), "python")
+}
+
+// runHTTPX pipes the discovered URLs into projectdiscovery httpx.
+func runHTTPX(bin string, urls []string, opts string) {
+	args := strings.Fields(opts)
+	cmd := exec.Command(bin, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		fmt.Printf("⚠️  Could not open stdin for httpx: %v\n", err)
+		return
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		fmt.Printf("⚠️  Could not start httpx: %v\n", err)
+		return
+	}
+	for _, u := range urls {
+		fmt.Fprintln(stdin, u)
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		fmt.Printf("⚠️  httpx exited with: %v\n", err)
+	}
 }
 
 func (s *scanner) progress(stop chan struct{}) {
