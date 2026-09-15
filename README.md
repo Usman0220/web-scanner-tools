@@ -91,6 +91,10 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 - 🔍 **Banner Probe**: `-banner` reports scheme, status, server and page title
 - 🔗 **httpx Integration**: found URLs stream to [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) immediately as ports are discovered (auto-detects `httpx`/`httpx-pd`/`httpx-toolkit`, skips the Python httpx client). Tune with `-httpx` and `-httpx-opts`; a `<out>.urls` list is still saved
 - 🚫 **Cloud/CDN Filter**: `-skip-cloud` (default on) drops ports whose banner/title matches providers like `Microsoft-Azure-Application-Gateway`; customize with `-cloud-patterns`
+- 🔥 **Juice Detector** (`-juice`, default on): every confirmed web server is probed for interesting things and **ranked 0-100** — admin panels (`/admin`, `/phpmyadmin`, `/wp-admin`), leaked secrets (`/.env`, `/.git/HEAD`, `/config.php`, `/phpinfo.php`, `.htaccess`, backups), login pages, IoT/camera fingerprints (Hikvision, Dahua, TP-Link...), tech fingerprints, version disclosure and directory listings. Hosts show a `🔸J<score>:tags` badge, and a **🏆 Top-Juicy summary** (sorted, `-top N`) is printed at the end
+- 🎯 **Filtering**: `-min-score N` only reports hosts with juice ≥ N; `-mc 200,301` only reports probed hosts whose status code matches
+- 💾 **Resumable**: random scans use a deterministic `-seed`; interrupt with Ctrl-C (with a resume hint) or resume later with `-seed <s> -skip <n>`
+- 📦 **JSONL export**: `-json results.jsonl` writes structured findings (score, tags, path hits) for feeding other tools
 - 💾 **Real-time Logging**: timestamped results file
 
 **Usage Examples:**
@@ -121,6 +125,15 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 
 # Pipe discovered ports into projectdiscovery httpx probes
 ./webport-scanner -local -httpx auto -httpx-opts "-status-code -title -tech-detect -web-server"
+
+# Juicy hunting: only report hosts scoring 50+, add your own extra paths
+./webport-scanner -local -min-score 50 -paths "/wp-config.php.bak,/debug"
+
+# Save structured findings to JSONL
+./webport-scanner -local -json findings.jsonl
+
+# Resume an interrupted 99,999-IP scan from where it stopped
+./webport-scanner -seed 1789448660119657726 -skip 42000
 ```
 
 ---

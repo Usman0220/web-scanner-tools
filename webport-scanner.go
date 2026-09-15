@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,9 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +41,89 @@ var defaultCloudPatterns = []string{
 // cloudPatterns is the active filter list (overridable via -cloud-patterns)
 var cloudPatterns = defaultCloudPatterns
 
+// commonServiceNames maps ports to well-known services for context in results
+var commonServiceNames = map[int]string{
+	21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+	80: "http", 81: "alt-http", 88: "kerberos", 110: "pop3", 111: "rpcbind",
+	143: "imap", 389: "ldap", 443: "https", 445: "smb", 465: "smtps",
+	587: "submission", 636: "ldaps", 993: "imaps", 995: "pop3s", 1080: "socks",
+	1433: "mssql", 1521: "oracle", 2049: "nfs", 2375: "docker", 2376: "docker-tls",
+	2379: "etcd", 3000: "grafana", 3306: "mysql", 3389: "rdp", 5000: "harbor/flask",
+	5001: "web", 5432: "postgres", 5601: "kibana", 5900: "vnc", 5985: "winrm",
+	5986: "winrm-https", 6379: "redis", 6443: "k8s-api", 7001: "weblogic",
+	8000: "alt-http", 8001: "web", 8080: "alt-http", 8081: "web", 8088: "web",
+	8181: "web", 8443: "alt-https", 8880: "alt-http", 8888: "web",
+	9000: "php-fpm/payara", 9090: "prometheus", 9200: "elasticsearch",
+	9443: "alt-https", 10000: "webmin", 11211: "memcached", 15672: "rabbitmq",
+	27017: "mongod", 28017: "mongod-web", 49152: "web", 50000: "web",
+}
+
+func serviceName(port int) string {
+	return commonServiceNames[port]
+}
+
+// jsonResult is one line of the optional JSONL export file
+type jsonResult struct {
+	IP         string   `json:"ip"`
+	Port       int      `json:"port"`
+	URL        string   `json:"url,omitempty"`
+	Scheme     string   `json:"scheme,omitempty"`
+	StatusCode int      `json:"status_code,omitempty"`
+	Server     string   `json:"server,omitempty"`
+	Title      string   `json:"title,omitempty"`
+	Service    string   `json:"service,omitempty"`
+	Juice      int      `json:"juice,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
+	PathHits   string   `json:"path_hits,omitempty"`
+	Timestamp  string   `json:"timestamp"`
+}
+
+// pathCheck is one juicy path probed on confirmed web servers
+type pathCheck struct {
+	Path   string
+	Admin  bool   // 401/403/302 also count as "exists"
+	Secret bool   // anything but 200 is ignored (solid find only)
+	Name   string // tag label
+	Weight int    // juice points on a 200
+}
+
+// juicyPaths is the default set of paths probed on each confirmed web server
+var juicyPaths = []pathCheck{
+	{"/admin", true, false, "admin", 25},
+	{"/admin/login", true, false, "admin-login", 25},
+	{"/login", true, false, "login", 22},
+	{"/login.php", true, false, "login", 22},
+	{"/wp-admin/", true, false, "wp-admin", 22},
+	{"/wp-admin/login.php", true, false, "wp-admin", 22},
+	{"/phpmyadmin/", true, false, "phpmyadmin", 25},
+	{"/phpmyadmin", true, false, "phpmyadmin", 22},
+	{"/db/", true, false, "db-admin", 20},
+	{"/upload/", true, false, "upload", 12},
+	{"/config.php", false, true, "config", 40},
+	{"/.env", false, true, ".env", 55},
+	{"/.git/HEAD", false, true, ".git", 45},
+	{"/.htaccess", false, true, ".htaccess", 20},
+	{"/phpinfo.php", false, true, "phpinfo", 40},
+	{"/backup/", false, true, "backup", 15},
+	{"/robots.txt", false, true, "robots", 5},
+}
+
+// devPorts marks ports that are themselves interesting (dev/alt/admin panels)
+var devPorts = map[int]string{
+	81: "alt-http", 8000: "alt-http", 8001: "alt-http", 8081: "alt-http",
+	8090: "alt-http", 8880: "alt-http", 8888: "alt-http", 7001: "weblogic",
+	9000: "app-server", 9443: "alt-https", 10000: "webmin", 5000: "dev-app",
+	5001: "dev-app", 3000: "dev-app", 5601: "kibana", 9090: "metrics",
+	9200: "elasticsearch", 2375: "docker", 2376: "docker-tls", 15672: "rabbitmq",
+	28017: "mongo-web", 27017: "mongo", 1433: "mssql", 5900: "vnc",
+}
+
+// Keyword sets used by the juice scorer
+var iotSignals = []string{"dahua", "hikv", "tenda", "tp-link", "tplink", "netgear", "linksys", "zyxel", "mikrotik", "axis", "webcam", "ipcam", "camera", "dvr", "nvr", "iptv", "qnap", "synology", "bosch", "reolink", "amcrest", "foscam", "router", "wemo", "wifi-"}
+var techSignals = []string{"wordpress", "laravel", "django", "spring", "tomcat", "jboss", "wildfly", "jenkins", "grafana", "kibana", "prometheus", "zabbix", "nagios", "netdata", "phpmyadmin", "nextcloud", "owncloud", "roundcube", "webmin", "hadoop", "harbor", "portainer", "minio", "sonarqube", "dokuwiki", "opencart", "moodle", "joomla", "drupal", "asp.net", "iis", "openresty", "caddy", "next.js", "nutanix", "sophos", "fortinet", "pfsense", "sabnzbd", "transmission", "radarr", "sonarr", "plex"}
+var loginSignals = []string{"login", "sign in", "sign-in", "signin", "log in", "authentication", "access panel", "control panel", "web portal", "console", "admin panel", "管理", "登录", "控制台"}
+var juicyRobotsDisallows = []string{"admin", "config", "backup", ".env", ".git", "sql", "db", "tmp", "login", "upload", "bak", "wp-", "cgi-bin", "debug", "app"}
+
 // Default web ports to scan when no -ports is given
 var defaultWebPorts = []int{80, 81, 443, 8080, 8443, 8000, 8888, 8880, 7001, 9000, 9443, 10000, 28017, 5000, 5001, 8001, 8081, 8090, 8888}
 
@@ -48,6 +135,10 @@ type Result struct {
 	StatusCode int
 	Server     string
 	Title      string
+	PoweredBy  string   // X-Powered-By / X-Generator header
+	Score      int      // 0-100 juice ranking
+	Tags       []string // interesting-finding tags
+	PathHits   string   // compact list of juicy path hits e.g. /admin(200)
 }
 
 // ANSI color helpers
@@ -68,22 +159,40 @@ func cyan(s string) string  { return colorCyan + s + colorReset }
 func bold(s string) string  { return colorBold + s + colorReset }
 
 type scanner struct {
-	ports    []int
-	timeout  time.Duration
-	workers  int
-	probe    bool
-	skipCloud bool
-	client   *http.Client
-	file     *os.File
-	fileMu   sync.Mutex
-	results  chan Result
-	cancel   chan struct{}
-	scanMu   sync.Mutex
-	scanned  int64
-	open     int64
-	lastTick time.Time
-
+	ports           []int
+	timeout         time.Duration
+	workers         int
+	probe           bool
+	skipCloud       bool
+	forceProbe      bool
+	juice           bool
+	minScore        int
+	customPaths     []string
+	statusMatch     func(int) bool
+	client          *http.Client
+	file            *os.File
+	fileMu          sync.Mutex
+	results         chan Result
+	cancel          chan struct{}
+	scanMu          sync.Mutex
+	scanned         int64
+	open            int64
+	filtered        int64
+	lastTick        time.Time
 	progressInterval time.Duration
+}
+
+// parsePathsFlag parses the -paths extra-paths flag into absolute paths
+func parsePathsFlag(s string) []string {
+	var paths []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.Trim(strings.TrimSpace(p), "/")
+		if p == "" {
+			continue
+		}
+		paths = append(paths, "/"+p)
+	}
+	return paths
 }
 
 func main() {
@@ -109,6 +218,14 @@ func main() {
 		httpxOptsF  = flag.String("httpx-opts", "-status-code -title -tech-detect -web-server", "extra flags passed to projectdiscovery httpx")
 		skipCloudF  = flag.Bool("skip-cloud", true, "drop open ports whose banner/title matches cloud/CDN providers (e.g. Microsoft-Azure-Application-Gateway)")
 		cloudF      = flag.String("cloud-patterns", "", "comma-separated keywords treated as cloud/CDN (default: microsoft,azure,amazon,aws,cloudfront,google,oracle,digitalocean,ovh,linode,hetzner,scaleway,vultr,cloudflare,akamai,fastly,incapsula,imperva,sucuri)")
+		seedF       = flag.Int64("seed", 0, "RNG seed for reproducible random IPs (0 = random seed)")
+		skipF       = flag.Int("skip", 0, "skip the first N generated random IPs (resume support)")
+		mcF         = flag.String("mc", "", "only report/stream ports whose probed status code is in this list (e.g. 200,301,302)")
+		jsonF       = flag.String("json", "", "also write results as JSONL to this file")
+		juiceF      = flag.Bool("juice", true, "probe discovered web servers for juicy findings (admin panels, secrets, IoT devices, dir listings) and rank 0-100")
+		minScoreF   = flag.Int("min-score", 0, "only report/stream hosts with juice score >= this value (0 = all)")
+		pathsF      = flag.String("paths", "", "extra paths to probe (comma-separated) in addition to the default juicy paths")
+		topJuicyF   = flag.Int("top", 15, "how many top juicy hosts to print in the final summary")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Web Port Scanner
@@ -173,6 +290,38 @@ Options:
 		cloudPatterns = pats
 	}
 
+	// Status-code match list
+	var matchCodes []int
+	matched := false
+	if *mcF != "" {
+		for _, c := range strings.Split(*mcF, ",") {
+			code, err := strconv.Atoi(strings.TrimSpace(c))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error in -mc: invalid status code %q\n", c)
+				os.Exit(1)
+			}
+			matchCodes = append(matchCodes, code)
+		}
+		matched = true
+	}
+	statusMatch := func(code int) bool {
+		if !matched {
+			return true
+		}
+		for _, c := range matchCodes {
+			if c == code {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Deterministic seed for reproducible/resumable random scans
+	seed := *seedF
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+
 	targets := flag.Args()
 	if *fileFlag != "" {
 		fromFile, err := readTargetsFile(*fileFlag)
@@ -221,7 +370,7 @@ Options:
 		if *exhaustF {
 			ips = enumerateLocalIPs()
 		} else {
-			ips = generateLocalIPs(randomCount)
+			ips = generateLocalIPs(randomCount, seed)
 		}
 	default:
 		if randomCount == 0 {
@@ -232,12 +381,21 @@ Options:
 		}
 		fmt.Printf("%s\n", green("🎯 Random IP scan mode: "+strconv.Itoa(randomCount)+" IPs"))
 		fmt.Println(bold("======================================"))
-		ips = generateRandomIPs(randomCount)
+		ips = generateRandomIPs(randomCount, seed)
+	}
+	// Resume support: drop the first N generated IPs
+	if *skipF > 0 {
+		if *skipF >= len(ips) {
+			fmt.Fprintf(os.Stderr, "Error: -skip %d is >= number of targets (%d). Nothing left to scan.\n", *skipF, len(ips))
+			os.Exit(1)
+		}
+		ips = ips[*skipF:]
 	}
 	if len(ips) == 0 {
 		fmt.Fprintln(os.Stderr, "No targets to scan.")
 		os.Exit(1)
 	}
+	fmt.Printf("%s\n", cyan(fmt.Sprintf("🎲 seed=%d targets=%d (resume with: -seed %d -skip %d)", seed, len(ips)+*skipF, seed, *skipF)))
 
 	// Parse ports
 	ports := defaultWebPorts
@@ -265,6 +423,10 @@ Options:
 		workers:          *workersF,
 		probe:            *probeF,
 		skipCloud:        *skipCloudF,
+		juice:            *juiceF,
+		minScore:         *minScoreF,
+		customPaths:      parsePathsFlag(*pathsF),
+		statusMatch:      statusMatch,
 		file:             file,
 		results:          make(chan Result, *queueF),
 		cancel:           make(chan struct{}),
@@ -331,6 +493,20 @@ Options:
 	var urls []string
 	var urlsMu sync.Mutex
 	var skipped int64
+	var filtered int64
+	var topMu sync.Mutex
+	var topAll []Result
+
+	// Optional JSONL export
+	var jf *os.File
+	if *jsonF != "" {
+		jf, err = os.Create(*jsonF)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not create JSONL file: %v\n", err)
+			jf = nil
+		}
+	}
+
 	resultWg.Add(1)
 	go func() {
 		defer resultWg.Done()
@@ -340,13 +516,43 @@ Options:
 				fmt.Printf("%s %s:%d server=%q\n", yellow("⛔ [SKIP cloud]"), r.Target, r.Port, r.Server)
 				continue
 			}
+			// -mc status filter
+			if !statusMatch(r.StatusCode) {
+				filtered++
+				continue
+			}
+			// -min-score juice floor
+			if s.minScore > 0 && r.Score < s.minScore {
+				filtered++
+				continue
+			}
 			line := r.String()
-			fmt.Println(strings.Replace(line, "[OPEN]", green("[OPEN]"), 1))
+			colored := strings.Replace(line, "[OPEN]", green("[OPEN]"), 1)
+			if r.Score > 0 {
+				colored = strings.Replace(colored, "🔸", bold(yellow("🔸")), 1)
+			}
+			fmt.Println(colored)
 			if s.file != nil {
 				s.fileMu.Lock()
 				s.file.WriteString(line + "\n")
 				s.file.Sync()
 				s.fileMu.Unlock()
+			}
+			if jf != nil {
+				rec := jsonResult{
+					IP: r.Target, Port: r.Port, URL: r.URLs()[0], Scheme: r.Scheme,
+					StatusCode: r.StatusCode, Server: r.Server, Title: r.Title,
+					Service: serviceName(r.Port), Juice: r.Score, Tags: r.Tags,
+					PathHits: r.PathHits, Timestamp: time.Now().UTC().Format(time.RFC3339),
+				}
+				if b, err := json.Marshal(rec); err == nil {
+					jf.Write(append(b, '\n'))
+				}
+			}
+			if r.Score > 0 {
+				topMu.Lock()
+				topAll = append(topAll, r)
+				topMu.Unlock()
 			}
 			for _, u := range r.URLs() {
 				urlsMu.Lock()
@@ -365,6 +571,19 @@ Options:
 	progStop := make(chan struct{})
 	go s.progress(progStop)
 
+	// Graceful Ctrl-C / SIGTERM: stop cleanly, keep results, print resume hint
+	stopOnce := sync.Once{}
+	stop := func() { stopOnce.Do(func() { close(s.cancel) }) }
+	sigCh := make(chan os.Signal, 1)
+	interruptCh := make(chan struct{})
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		close(interruptCh)
+		fmt.Printf("\n%s\n", yellow("🛑 Interrupt received - stopping scan and saving results..."))
+		stop()
+	}()
+
 	// Kick off scanning
 	var scanWg sync.WaitGroup
 	jobCh := make(chan scanJob, s.workers)
@@ -372,8 +591,9 @@ Options:
 		scanWg.Add(1)
 		go s.worker(jobCh, &scanWg)
 	}
+	var dispatched int
 scanLoop:
-	for _, ip := range ips {
+	for i, ip := range ips {
 		for _, p := range s.ports {
 			select {
 			case jobCh <- scanJob{ip: ip, port: p}:
@@ -381,12 +601,13 @@ scanLoop:
 				break scanLoop
 			}
 		}
+		dispatched = i + 1
 	}
 	close(jobCh)
 	scanWg.Wait()
 
 	s.progressOnce()
-	close(s.cancel)
+	stop()
 	close(progStop)
 	close(s.results)
 	resultWg.Wait()
@@ -400,12 +621,45 @@ scanLoop:
 	}
 
 	if s.file != nil {
-		footer := fmt.Sprintf("\n%s\nScan finished at: %s\nIPs scanned: %d\nOpen web ports found: %d\nCloud/CDN ports skipped: %d\n",
-			strings.Repeat("=", 60), time.Now().Format("2006-01-02 15:04:05"), len(ips), s.open, skipped)
+		footer := fmt.Sprintf("\n%s\nScan finished at: %s\nIPs scanned: %d\nOpen web ports found: %d\nCloud/CDN ports skipped: %d\nFiltered (mc/min-score): %d\n",
+			strings.Repeat("=", 60), time.Now().Format("2006-01-02 15:04:05"), len(ips), s.open, skipped, filtered)
 		s.file.WriteString(footer)
 		s.file.Close()
 	}
-	fmt.Printf("\n%s\n", green(fmt.Sprintf("✅ Scan complete! %d open web ports found across %d IPs (%d skipped as cloud/CDN). Results in %s", s.open, len(ips), skipped, outPath)))
+	if jf != nil {
+		jf.Sync()
+		jf.Close()
+	}
+	fmt.Printf("\n%s\n", green(fmt.Sprintf("✅ Scan complete! %d open web ports found across %d IPs (%d skipped as cloud/CDN, %d filtered). Results in %s", s.open, len(ips), skipped, filtered, outPath)))
+	interrupted := false
+	select {
+	case <-interruptCh:
+		interrupted = true
+	default:
+	}
+	resumeSkip := *skipF + dispatched
+	if interrupted {
+		fmt.Printf("%s\n", yellow(fmt.Sprintf("⚠️  Scan interrupted after ~%d of %d IPs", dispatched, len(ips)+*skipF)))
+	}
+	fmt.Printf("%s\n", cyan(fmt.Sprintf("💾 Resume anytime with: -seed %d -skip %d", seed, resumeSkip)))
+
+	// Top juicy targets
+	if len(topAll) > 0 {
+		sort.Slice(topAll, func(i, j int) bool { return topAll[i].Score > topAll[j].Score })
+		n := *topJuicyF
+		if n > len(topAll) {
+			n = len(topAll)
+		}
+		fmt.Printf("\n%s\n", bold(yellow(fmt.Sprintf("🏆 Top %d juicy targets:", n))))
+		for i, r := range topAll[:n] {
+			u := r.URLs()[0]
+			if r.Scheme == "" && len(r.URLs()) > 1 {
+				u = r.URLs()[1]
+			}
+			fmt.Printf("  %d. J%02d  %s  %s\n", i+1, r.Score, u, strings.Join(r.Tags, ","))
+		}
+		fmt.Println()
+	}
 
 	// Write the collected URL list for later use
 	if len(urls) > 0 {
@@ -431,9 +685,12 @@ func (s *scanner) worker(jobs <-chan scanJob, wg *sync.WaitGroup) {
 			s.open++
 			s.scanMu.Unlock()
 			found := Result{Target: j.ip, Port: j.port}
-			// Probe banner when requested, or when cloud filtering needs the Server header
-			if s.probe || s.skipCloud {
+			// Probe banner when requested, or when cloud filtering / juice needs headers
+			if s.probe || s.skipCloud || s.juice {
 				found = s.probeBanner(j.ip, j.port)
+				if s.juice && found.Scheme != "" {
+					s.assessJuice(&found)
+				}
 			}
 			s.results <- found
 		}
@@ -478,6 +735,10 @@ func (s *scanner) probeBanner(ip string, port int) Result {
 	r.Scheme = scheme
 	r.StatusCode = resp.StatusCode
 	r.Server = resp.Header.Get("Server")
+	r.PoweredBy = resp.Header.Get("X-Powered-By")
+	if r.PoweredBy == "" {
+		r.PoweredBy = resp.Header.Get("X-Generator")
+	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
 	r.Title = extractTitle(string(body))
@@ -501,6 +762,191 @@ func extractTitle(content string) string {
 		return ""
 	}
 	return strings.TrimSpace(body[start : start+end])
+}
+
+// assessJuice ranks a probed host 0-100 based on juicy signals:
+// panels/secrets found, IoT fingerprints, version disclosure, dir listings.
+// Path probing only runs on hosts that actually answered HTTP(S).
+func (s *scanner) assessJuice(r *Result) {
+	low := strings.ToLower(r.Title + " " + r.Server + " " + r.PoweredBy)
+	var tags []string
+	score := 0
+	add := func(n int, tag string) {
+		score += n
+		if tag != "" {
+			tags = append(tags, tag)
+		}
+	}
+
+	// Port itself is interesting (dev ports, admin panels, exposed services)
+	if svc, ok := devPorts[r.Port]; ok {
+		add(10, "dev-port:"+svc)
+	}
+
+	// Version disclosure in Server header
+	if hasVersion(r.Server) {
+		add(8, "version")
+	}
+
+	// X-Powered-By / X-Generator
+	if r.PoweredBy != "" {
+		add(5, "powered-by")
+	}
+
+	// Recognizable tech stack
+	if t := firstMatch(low, techSignals); t != "" {
+		add(8, t)
+	}
+
+	// IoT / camera / router fingerprint -> high value
+	if t := firstMatch(low, iotSignals); t != "" {
+		add(15, "iot:"+t)
+	}
+
+	// Login / admin wording on the front page
+	if firstMatch(low, loginSignals) != "" {
+		add(8, "login")
+	}
+
+	// Directory listing
+	if strings.Contains(low, "index of") {
+		add(18, "dirlisting")
+	}
+
+	// Path probing - only when we actually talked HTTP(S)
+	if r.Scheme != "" {
+		s.probeJuicyPaths(r, &score, &tags, &add)
+	}
+
+	// Dedupe tags, cap at 100
+	seen := make(map[string]bool)
+	clean := tags[:0]
+	for _, t := range tags {
+		if !seen[t] {
+			seen[t] = true
+			clean = append(clean, t)
+		}
+	}
+	tags = clean
+	if score > 100 {
+		score = 100
+	}
+	r.Score = score
+	r.Tags = tags
+}
+
+// probeJuicyPaths issues lightweight GETs against juicy paths
+func (s *scanner) probeJuicyPaths(r *Result, score *int, tags *[]string, add *func(int, string)) {
+	base := fmt.Sprintf("%s://%s", r.Scheme, net.JoinHostPort(r.Target, strconv.Itoa(r.Port)))
+	paths := juicyPaths
+	for _, p := range s.customPaths {
+		paths = append(paths, pathCheck{Path: p, Name: p, Weight: 8})
+	}
+	hits := ""
+	for _, pc := range paths {
+		status, body := s.pathStatus(base + pc.Path)
+		if status == 0 {
+			continue
+		}
+		// robots.txt: count disallowed paths
+		if pc.Path == "/robots.txt" && status == 200 {
+			n, hasJuicy := juicyRobots(body)
+			if n > 0 {
+				(*add)(minInt(n*3, 12), fmt.Sprintf("robots(%d)", n))
+			} else if hasJuicy {
+				(*add)(10, "robots")
+			}
+			continue
+		}
+		hit := false
+		switch {
+		case status == 200: // hard hit
+			(*add)(pc.Weight, pc.Name)
+			hit = true
+		case pc.Admin && !pc.Secret && (status == 401 || status == 403 || status == 302):
+			(*add)(maxInt(pc.Weight-8, 5), pc.Name+":protected")
+			hit = true
+		}
+		if hit {
+			if hits != "" {
+				hits += ","
+			}
+			hits += fmt.Sprintf("%s(%d)", pc.Path, status)
+		}
+	}
+	if hits != "" {
+		r.PathHits = hits
+	}
+}
+
+// pathStatus GETs a path and returns (status, body-snippet). 0 means no HTTP response.
+func (s *scanner) pathStatus(url string) (int, string) {
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
+	return resp.StatusCode, string(body)
+}
+
+// juicyRobots parses a robots.txt body for Disallow entries; returns count and
+// whether any entry looks interesting (admin/config/secret-ish).
+func juicyRobots(body string) (int, bool) {
+	count := 0
+	anyInteresting := false
+	for _, line := range strings.Split(body, "\n") {
+		l := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(l, "disallow:") {
+			count++
+			for _, kw := range juicyRobotsDisallows {
+				if strings.Contains(l, kw) {
+					anyInteresting = true
+					break
+				}
+			}
+		}
+	}
+	return count, anyInteresting
+}
+
+// hasVersion reports whether s looks like a versioned server banner
+func hasVersion(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' && s[i+1] == '.' {
+			return true
+		}
+	}
+	return false
+}
+
+// firstMatch returns the first needle found in hay, else ""
+func firstMatch(hay string, needles []string) string {
+	for _, n := range needles {
+		if strings.Contains(hay, n) {
+			return n
+		}
+	}
+	return ""
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // URLs returns the URL(s) to probe for this open port. If the scheme is
@@ -537,6 +983,16 @@ func (r Result) String() string {
 	}
 	if r.Title != "" {
 		parts = append(parts, fmt.Sprintf("title=%q", r.Title))
+	}
+	if r.Score > 0 {
+		juiceStr := fmt.Sprintf("J%d", r.Score)
+		if len(r.Tags) > 0 {
+			juiceStr += ":" + strings.Join(r.Tags, ",")
+		}
+		parts = append(parts, fmt.Sprintf("🔸%s", juiceStr))
+		if r.PathHits != "" {
+			parts = append(parts, "paths="+r.PathHits)
+		}
 	}
 	return strings.Join(parts, " | ")
 }
@@ -695,27 +1151,28 @@ func readTargetsFile(path string) ([]string, error) {
 	return out, sc.Err()
 }
 
-// generateRandomIP creates a random IP from predefined network blocks (same as the other scanners)
-func generateRandomIP() string {
-	block := networkBlocks[rand.Intn(len(networkBlocks))]
-	octet2 := rand.Intn(256)
-	octet3 := rand.Intn(256)
-	octet4 := rand.Intn(254) + 1 // 1-254, avoiding 0
-	return fmt.Sprintf("%d.%d.%d.%d", block, octet2, octet3, octet4)
-}
-
-// generateRandomIPs returns count random IPs
-func generateRandomIPs(count int) []string {
-	rand.Seed(time.Now().UnixNano())
+// generateRandomIPs returns count random internet-block IPs from a seeded RNG.
+// With the same seed the sequence is identical, enabling -skip resume.
+func generateRandomIPs(count int, seed int64) []string {
+	rng := rand.New(rand.NewSource(seed))
 	ips := make([]string, count)
 	for i := 0; i < count; i++ {
-		ips[i] = generateRandomIP()
+		ips[i] = generateRandomIP(rng)
 	}
 	return ips
 }
 
+// generateRandomIP creates a random IP from the network blocks using the given RNG
+func generateRandomIP(rng *rand.Rand) string {
+	block := networkBlocks[rng.Intn(len(networkBlocks))]
+	octet2 := rng.Intn(256)
+	octet3 := rng.Intn(256)
+	octet4 := rng.Intn(254) + 1 // 1-254, avoiding 0
+	return fmt.Sprintf("%d.%d.%d.%d", block, octet2, octet3, octet4)
+}
+
 // generateLocalIP creates a random IP from the enabled local class ranges
-func generateLocalIP() string {
+func generateLocalIP(rng *rand.Rand) string {
 	// Collect enabled classes and pick one at random
 	var classes []int
 	if scanClassA {
@@ -727,22 +1184,22 @@ func generateLocalIP() string {
 	if scanClassC {
 		classes = append(classes, 3) // 192.168.0.0/16
 	}
-	switch classes[rand.Intn(len(classes))] {
+	switch classes[rng.Intn(len(classes))] {
 	case 1:
-		return fmt.Sprintf("10.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(254)+1)
+		return fmt.Sprintf("10.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(254)+1)
 	case 2:
-		return fmt.Sprintf("172.%d.%d.%d", 16+rand.Intn(16), rand.Intn(256), rand.Intn(254)+1)
+		return fmt.Sprintf("172.%d.%d.%d", 16+rng.Intn(16), rng.Intn(256), rng.Intn(254)+1)
 	default:
-		return fmt.Sprintf("192.168.%d.%d", rand.Intn(256), rand.Intn(254)+1)
+		return fmt.Sprintf("192.168.%d.%d", rng.Intn(256), rng.Intn(254)+1)
 	}
 }
 
-// generateLocalIPs returns count random IPs from the enabled class ranges
-func generateLocalIPs(count int) []string {
-	rand.Seed(time.Now().UnixNano())
+// generateLocalIPs returns count random IPs from the enabled class ranges (seeded)
+func generateLocalIPs(count int, seed int64) []string {
+	rng := rand.New(rand.NewSource(seed))
 	ips := make([]string, count)
 	for i := 0; i < count; i++ {
-		ips[i] = generateLocalIP()
+		ips[i] = generateLocalIP(rng)
 	}
 	return ips
 }
