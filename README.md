@@ -94,7 +94,7 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 - 🔥 **Juice Detector** (`-juice`, default on): every confirmed web server is probed for interesting things and **ranked 0-100** — admin panels (`/admin`, `/phpmyadmin`, `/wp-admin`), leaked secrets (`/.env`, `/.git/HEAD`, `/config.php`, `/phpinfo.php`, `.htaccess`, backups), login pages, IoT/camera fingerprints (Hikvision, Dahua, TP-Link...), tech fingerprints, version disclosure and directory listings. Hosts show a `🔸J<score>:tags` badge, and a **🏆 Top-Juicy summary** (sorted, `-top N`) is printed at the end
 - 🎯 **Filtering**: `-min-score N` only reports hosts with juice ≥ N; `-mc 200,301` only reports probed hosts whose status code matches
 - 💾 **Resumable**: random scans use a deterministic `-seed`; interrupt with Ctrl-C (with a resume hint) or resume later with `-seed <s> -skip <n>`
-- 🌐 **Auto-open in browser** (`-open N`): when the scan finishes, the top-N juicy targets open automatically in a running browser (Brave/Chrome/Chromium/Edge/Firefox — auto-detected, or force with `-browser brave`). Launches the same binary, so your running session's flags like `--ignore-certificate-errors` apply
+- 🌐 **Auto-open in browser** (`-open N`): juicy targets open in a running browser **immediately, the moment their juice score lands** — no waiting for the scan to finish. `-open-score` sets the minimum juice (default 30), `-open N` caps total tabs, and `-browser brave` forces a specific one (by default a running Brave/Chrome/Chromium/Edge/Firefox is auto-detected). Launching the same binary hands off to your running session, so flags like `--ignore-certificate-errors` apply
 - 📦 **JSONL export**: `-json results.jsonl` writes structured findings (score, tags, path hits) for feeding other tools
 - 💾 **Real-time Logging**: timestamped results file
 
@@ -133,8 +133,8 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 # Save structured findings to JSONL
 ./webport-scanner -local -json findings.jsonl
 
-# Hunt juicy hosts (score >= 50) and open the top 5 in your running Brave
-./webport-scanner -local -min-score 50 -open 5 -browser brave
+# Hunt juicy hosts (score >= 50) and open each in your running Brave the moment it is found
+./webport-scanner -local -min-score 50 -open 10 -open-score 50 -browser brave
 
 # Resume an interrupted 99,999-IP scan from where it stopped
 ./webport-scanner -seed 1789448660119657726 -skip 42000

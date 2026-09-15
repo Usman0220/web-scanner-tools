@@ -228,7 +228,8 @@ func main() {
 		minScoreF   = flag.Int("min-score", 0, "only report/stream hosts with juice score >= this value (0 = all)")
 		pathsF      = flag.String("paths", "", "extra paths to probe (comma-separated) in addition to the default juicy paths")
 		topJuicyF   = flag.Int("top", 15, "how many top juicy hosts to print in the final summary")
-		openF       = flag.Int("open", 0, "open the top N juicy targets automatically in a running browser when the scan finishes (0 = off)")
+		openF       = flag.Int("open", 0, "auto-open juicy targets in a running browser IMMEDIATELY as they are found (max tabs; 0 = off)")
+		openScoreF  = flag.Int("open-score", 30, "minimum juice score for a host to be auto-opened in the browser")
 		browserF    = flag.String("browser", "", "browser executable to open targets with (default: auto-detect a running browser: brave, chrome, chromium, edge, firefox...)")
 	)
 	flag.Usage = func() {
@@ -513,6 +514,21 @@ Options:
 		}
 	}
 
+	// Browser auto-open: detect the running browser once, stream-open as found
+	var openBin string
+	openLeft := *openF
+	if openLeft > 0 {
+		openBin = *browserF
+		if openBin == "" {
+			openBin = runningBrowser()
+		}
+		if openBin == "" {
+			fmt.Printf("%s\n", yellow("No running browser detected (brave/chrome/chromium/edge/firefox) - start one, or set -browser <exe>."))
+		} else {
+			fmt.Printf("%s\n", cyan(fmt.Sprintf("🌐 Auto-opening juicy targets (J >= %d, max %d tabs) in %s as they are found...", *openScoreF, openLeft, openBin)))
+		}
+	}
+
 	resultWg.Add(1)
 	go func() {
 		defer resultWg.Done()
@@ -553,6 +569,19 @@ Options:
 				}
 				if b, err := json.Marshal(rec); err == nil {
 					jf.Write(append(b, '\n'))
+				}
+			}
+			// Immediate browser open for juicy hosts
+			if openBin != "" && openLeft > 0 && r.Score >= *openScoreF {
+				u := r.URLs()[0]
+				if r.Scheme == "" && len(r.URLs()) > 1 {
+					u = r.URLs()[1]
+				}
+				if openInBrowser(openBin, u) {
+					openLeft--
+					fmt.Printf("%s\n", cyan(fmt.Sprintf("🌐 Opened J%d %s (%s)", r.Score, u, openBin)))
+				} else if lastOpenErr != "" {
+					fmt.Printf("%s\n", yellow(fmt.Sprintf("⚠️  Could not open %s: %s", u, lastOpenErr)))
 				}
 			}
 			if r.Score > 0 {
@@ -666,38 +695,6 @@ scanLoop:
 			fmt.Printf("  %d. J%02d  %s  %s\n", i+1, r.Score, u, strings.Join(r.Tags, ","))
 		}
 		fmt.Println()
-	}
-
-	// Auto-open top juicy targets in a running browser
-	if *openF > 0 {
-		n := *openF
-		if n > len(topAll) {
-			n = len(topAll)
-		}
-		if n == 0 {
-			fmt.Printf("%s\n", yellow("No juicy targets to open."))
-		} else {
-			bin := *browserF
-			if bin == "" {
-				bin = runningBrowser()
-				if bin == "" {
-					fmt.Printf("%s\n", yellow("No running browser detected (brave/chrome/chromium/edge/firefox). Start one, or set -browser <exe>."))
-				}
-			}
-			if bin != "" {
-				for _, r := range topAll[:n] {
-					u := r.URLs()[0]
-					if r.Scheme == "" && len(r.URLs()) > 1 {
-						u = r.URLs()[1]
-					}
-					if openInBrowser(bin, u) {
-						fmt.Printf("%s\n", cyan(fmt.Sprintf("🌐 Opened %s (%s)", u, bin)))
-					} else {
-						fmt.Printf("%s\n", yellow(fmt.Sprintf("⚠️  Could not open %s: %s", u, lastOpenErr)))
-					}
-				}
-			}
-		}
 	}
 
 	// Write the collected URL list for later use
