@@ -86,7 +86,7 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 - 🎯 **Targets**: single IP/host, CIDR (`10.0.0.0/24`), IP range, hosts, or a targets file
 - 🏠 **Local Mode**: `-local` scans private Class A (10/8), B (172.16/12), C (192.168/16) ranges, incl. `-exhaust` full enumeration
 - 🎲 **Random IPs**: default 99,999 random IPs from internet blocks when no target is given; `-blocks` and `-count` control them
-- ⚙️ **Custom Ports**: `-ports` flag with ranges (`-ports 80,443,8000-8100`)
+- ⚙️ **Custom Ports**: `-ports` flag with ranges (`-ports 80,443,8000-8100`); the **default list includes web UIs + IoT/camera ports** (81-85, 554 RTSP, 7547 TR-069, 34567 Hikvision, 37200 Xiaomi, 37777 Dahua, 49152 camera web, and alt-web 800/8080-8089/9999...)
 - 🏎️ **Concurrent**: worker pool with tunable `-workers` and `-timeout`
 - 🔍 **Banner Probe**: `-banner` reports scheme, status, server and page title
 - 🔗 **httpx Integration**: found URLs stream to [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) immediately as ports are discovered (auto-detects `httpx`/`httpx-pd`/`httpx-toolkit`, skips the Python httpx client). Tune with `-httpx` and `-httpx-opts`; a `<out>.urls` list is still saved

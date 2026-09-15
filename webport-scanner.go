@@ -109,14 +109,19 @@ var juicyPaths = []pathCheck{
 	{"/robots.txt", false, true, "robots", 5},
 }
 
-// devPorts marks ports that are themselves interesting (dev/alt/admin panels)
+// devPorts marks ports that are themselves interesting (dev/alt/admin panels/cameras)
 var devPorts = map[int]string{
-	81: "alt-http", 8000: "alt-http", 8001: "alt-http", 8081: "alt-http",
-	8090: "alt-http", 8880: "alt-http", 8888: "alt-http", 7001: "weblogic",
-	9000: "app-server", 9443: "alt-https", 10000: "webmin", 5000: "dev-app",
-	5001: "dev-app", 3000: "dev-app", 5601: "kibana", 9090: "metrics",
-	9200: "elasticsearch", 2375: "docker", 2376: "docker-tls", 15672: "rabbitmq",
-	28017: "mongo-web", 27017: "mongo", 1433: "mssql", 5900: "vnc",
+	81: "alt-http", 82: "alt-http", 83: "alt-http", 84: "alt-http", 85: "alt-http",
+	88: "alt-http", 89: "alt-http", 800: "alt-http", 8000: "alt-http",
+	8001: "alt-http", 8081: "alt-http", 8082: "alt-http", 8085: "alt-http",
+	8086: "alt-http", 8087: "alt-http", 8088: "alt-http", 8089: "alt-http",
+	8090: "alt-http", 8181: "alt-http", 8899: "alt-http", 9999: "alt-http",
+	7001: "weblogic", 9000: "app-server", 9443: "alt-https", 10000: "webmin",
+	5000: "dev-app", 5001: "dev-app", 3000: "dev-app", 5601: "kibana",
+	9090: "metrics", 9200: "elasticsearch", 2375: "docker", 2376: "docker-tls",
+	15672: "rabbitmq", 28017: "mongo-web", 27017: "mongo", 1433: "mssql", 5900: "vnc",
+	554: "rtsp/camera", 7547: "tr-069(cwmp)", 34567: "hikv-rtsp/cam", 37200: "xiaomi-web",
+	37777: "dahua-admin", 49152: "camera-web",
 }
 
 // Keyword sets used by the juice scorer
@@ -126,7 +131,7 @@ var loginSignals = []string{"login", "sign in", "sign-in", "signin", "log in", "
 var juicyRobotsDisallows = []string{"admin", "config", "backup", ".env", ".git", "sql", "db", "tmp", "login", "upload", "bak", "wp-", "cgi-bin", "debug", "app"}
 
 // Default web ports to scan when no -ports is given
-var defaultWebPorts = []int{80, 81, 443, 8080, 8443, 8000, 8888, 8880, 7001, 9000, 9443, 10000, 28017, 5000, 5001, 8001, 8081, 8090, 8888}
+var defaultWebPorts = []int{80, 81, 82, 83, 84, 85, 88, 89, 443, 554, 800, 8000, 8001, 8080, 8081, 8082, 8085, 8086, 8087, 8088, 8089, 8090, 8181, 8443, 8880, 8888, 9000, 9443, 9999, 10000, 28017, 5000, 5001, 7547, 34567, 37200, 37777, 49152}
 
 // Result holds one discovered open web port
 type Result struct {
@@ -199,7 +204,7 @@ func parsePathsFlag(s string) []string {
 
 func main() {
 	var (
-		portsFlag   = flag.String("ports", "", "web ports to scan, comma-separated (default: 80,81,443,8080,8443,8000,8888,8880,7001,9000,9443,10000,28017,5000,5001,8001,8081,8090)")
+		portsFlag   = flag.String("ports", "", "web ports to scan, comma-separated (default includes web UIs + IoT/camera ports: 80,81-85,88,89,443,554,800,8000-8001,8080-8089,8090,8181,8443,8880,8888,9000,9443,9999,10000,28017,5000,5001,7547,34567,37200,37777,49152)")
 		fileFlag    = flag.String("file", "", "scan targets from file (one per line: IP, host, CIDR, or range)")
 		timeoutF    = flag.Duration("timeout", 2*time.Second, "connection timeout per port")
 		workersF    = flag.Int("workers", 200, "number of concurrent scan workers")
@@ -223,6 +228,7 @@ func main() {
 		seedF       = flag.Int64("seed", 0, "RNG seed for reproducible random IPs (0 = random seed)")
 		skipF       = flag.Int("skip", 0, "skip the first N generated random IPs (resume support)")
 		mcF         = flag.String("mc", "", "only report/stream ports whose probed status code is in this list (e.g. 200,301,302)")
+		xmcF        = flag.String("xmc", "403", "exclude ports whose probed status code is in this list (e.g. 403,404); empty = keep all")
 		jsonF       = flag.String("json", "", "also write results as JSONL to this file")
 		juiceF      = flag.Bool("juice", true, "probe discovered web servers for juicy findings (admin panels, secrets, IoT devices, dir listings) and rank 0-100")
 		minScoreF   = flag.Int("min-score", 0, "only report/stream hosts with juice score >= this value (0 = all)")
@@ -309,6 +315,22 @@ Options:
 		}
 		matched = true
 	}
+	if len(matchCodes) == 0 {
+		matched = false
+	}
+	// Excluded status codes (default: 403)
+	excludeCodes := map[int]bool{}
+	if *xmcF != "" {
+		for _, c := range strings.Split(*xmcF, ",") {
+			code, err := strconv.Atoi(strings.TrimSpace(c))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error in -xmc: invalid status code %q\n", c)
+				os.Exit(1)
+			}
+			excludeCodes[code] = true
+		}
+	}
+
 	statusMatch := func(code int) bool {
 		if !matched {
 			return true
@@ -540,6 +562,11 @@ Options:
 			}
 			// -mc status filter
 			if !statusMatch(r.StatusCode) {
+				filtered++
+				continue
+			}
+			// -xmc excluded status filter (default 403)
+			if excludeCodes[r.StatusCode] {
 				filtered++
 				continue
 			}
