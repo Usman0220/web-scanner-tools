@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -170,6 +171,7 @@ type scanner struct {
 	customPaths     []string
 	statusMatch     func(int) bool
 	client          *http.Client
+	ctx             context.Context
 	file            *os.File
 	fileMu          sync.Mutex
 	results         chan Result
@@ -226,6 +228,8 @@ func main() {
 		minScoreF   = flag.Int("min-score", 0, "only report/stream hosts with juice score >= this value (0 = all)")
 		pathsF      = flag.String("paths", "", "extra paths to probe (comma-separated) in addition to the default juicy paths")
 		topJuicyF   = flag.Int("top", 15, "how many top juicy hosts to print in the final summary")
+		openF       = flag.Int("open", 0, "open the top N juicy targets automatically in a running browser when the scan finishes (0 = off)")
+		browserF    = flag.String("browser", "", "browser executable to open targets with (default: auto-detect a running browser: brave, chrome, chromium, edge, firefox...)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Web Port Scanner
@@ -441,6 +445,8 @@ Options:
 	}
 
 	// HTTP client for banner probing
+	scanCtx, cancelScanCtx := context.WithCancel(context.Background())
+	s.ctx = scanCtx
 	s.client = &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
@@ -581,6 +587,7 @@ Options:
 		<-sigCh
 		close(interruptCh)
 		fmt.Printf("\n%s\n", yellow("🛑 Interrupt received - stopping scan and saving results..."))
+		cancelScanCtx()
 		stop()
 	}()
 
@@ -661,6 +668,38 @@ scanLoop:
 		fmt.Println()
 	}
 
+	// Auto-open top juicy targets in a running browser
+	if *openF > 0 {
+		n := *openF
+		if n > len(topAll) {
+			n = len(topAll)
+		}
+		if n == 0 {
+			fmt.Printf("%s\n", yellow("No juicy targets to open."))
+		} else {
+			bin := *browserF
+			if bin == "" {
+				bin = runningBrowser()
+				if bin == "" {
+					fmt.Printf("%s\n", yellow("No running browser detected (brave/chrome/chromium/edge/firefox). Start one, or set -browser <exe>."))
+				}
+			}
+			if bin != "" {
+				for _, r := range topAll[:n] {
+					u := r.URLs()[0]
+					if r.Scheme == "" && len(r.URLs()) > 1 {
+						u = r.URLs()[1]
+					}
+					if openInBrowser(bin, u) {
+						fmt.Printf("%s\n", cyan(fmt.Sprintf("🌐 Opened %s (%s)", u, bin)))
+					} else {
+						fmt.Printf("%s\n", yellow(fmt.Sprintf("⚠️  Could not open %s: %s", u, lastOpenErr)))
+					}
+				}
+			}
+		}
+	}
+
 	// Write the collected URL list for later use
 	if len(urls) > 0 {
 		urlFile := outPath + ".urls"
@@ -680,6 +719,12 @@ type scanJob struct {
 func (s *scanner) worker(jobs <-chan scanJob, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for j := range jobs {
+		// Abort early on interrupt: skip queued-but-unstarted jobs
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
 		if s.scanPort(j.ip, j.port) {
 			s.scanMu.Lock()
 			s.open++
@@ -702,6 +747,11 @@ func (s *scanner) worker(jobs <-chan scanJob, wg *sync.WaitGroup) {
 
 // scanPort checks if a TCP port is open
 func (s *scanner) scanPort(ip string, port int) bool {
+	select {
+	case <-s.ctx.Done():
+		return false
+	default:
+	}
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, s.timeout)
 	if err != nil {
@@ -724,7 +774,8 @@ func (s *scanner) probeBanner(ip string, port int) Result {
 	}
 
 	url := fmt.Sprintf("%s://%s/", scheme, net.JoinHostPort(ip, strconv.Itoa(port)))
-	resp, err := s.client.Get(url)
+	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, url, nil)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		// Some servers only speak the other scheme; the raw port is still open
 		r.Scheme = scheme
@@ -881,7 +932,7 @@ func (s *scanner) probeJuicyPaths(r *Result, score *int, tags *[]string, add *fu
 
 // pathStatus GETs a path and returns (status, body-snippet). 0 means no HTTP response.
 func (s *scanner) pathStatus(url string) (int, string) {
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36")
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -1049,6 +1100,8 @@ func (s *scanner) progress(stop chan struct{}) {
 		select {
 		case <-stop:
 			return
+		case <-s.ctx.Done():
+			return
 		case <-ticker.C:
 			s.progressOnce()
 		}
@@ -1149,6 +1202,56 @@ func readTargetsFile(path string) ([]string, error) {
 		out = append(out, line)
 	}
 	return out, sc.Err()
+}
+
+// browserExecs are preferred browsers in order (auto-detection)
+var browserExecs = []string{
+	"brave", "brave-browser", "google-chrome", "google-chrome-stable", "chromium",
+	"chromium-browser", "microsoft-edge", "vivaldi", "opera", "zen-browser", "firefox",
+}
+
+// runningBrowser returns the executable of a browser that is currently running.
+// Launching the same binary with a URL reuses the already-running window (and its
+// flags, e.g. --ignore-certificate-errors) instead of starting a new instance.
+func runningBrowser() string {
+	out, err := exec.Command("ps", "-e", "-o", "comm=").Output()
+	if err != nil {
+		return ""
+	}
+	running := map[string]bool{}
+	for _, name := range strings.Fields(string(out)) {
+		running[name] = true
+	}
+	for _, name := range browserExecs {
+		if running[name] {
+			if p, err := exec.LookPath(name); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+var lastOpenErr string
+
+// openInBrowser opens url in the given browser. For chrome-family browsers the
+// launcher hands the URL to the running instance; xdg-open is a fallback.
+func openInBrowser(bin, url string) bool {
+	var args []string
+	if strings.Contains(bin, "firefox") || strings.Contains(bin, "zen-browser") {
+		args = []string{"--new-tab", url}
+	} else {
+		args = []string{url}
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Stderr = nil
+	cmd.Stdout = nil
+	if err := cmd.Start(); err != nil {
+		lastOpenErr = err.Error()
+		return false
+	}
+	go cmd.Wait()
+	return true
 }
 
 // generateRandomIPs returns count random internet-block IPs from a seeded RNG.
