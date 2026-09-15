@@ -25,6 +25,18 @@ var scanClassA bool // 10.0.0.0/8
 var scanClassB bool // 172.16.0.0/12
 var scanClassC bool // 192.168.0.0/16
 
+// defaultCloudPatterns are keywords matched against the banner Server/title
+// to drop open ports owned by cloud/CDN providers.
+var defaultCloudPatterns = []string{
+	"microsoft", "azure", "azureedge", "amazon", "aws", "cloudfront",
+	"google", "googleusercontent", "oracle", "digitalocean", "ovh",
+	"linode", "hetzner", "scaleway", "vultr", "cloudflare", "akamai",
+	"fastly", "incapsula", "imperva", "sucuri",
+}
+
+// cloudPatterns is the active filter list (overridable via -cloud-patterns)
+var cloudPatterns = defaultCloudPatterns
+
 // Default web ports to scan when no -ports is given
 var defaultWebPorts = []int{80, 81, 443, 8080, 8443, 8000, 8888, 8880, 7001, 9000, 9443, 10000, 28017, 5000, 5001, 8001, 8081, 8090, 8888}
 
@@ -43,6 +55,7 @@ type scanner struct {
 	timeout  time.Duration
 	workers  int
 	probe    bool
+	skipCloud bool
 	client   *http.Client
 	file     *os.File
 	fileMu   sync.Mutex
@@ -77,6 +90,8 @@ func main() {
 		headerTF    = flag.Duration("banner-timeout", 3*time.Second, "response header timeout for banner probing")
 		httpxF      = flag.String("httpx", "auto", "pipe found URLs to projectdiscovery httpx ('auto' to detect, binary name/path, or 'off')")
 		httpxOptsF  = flag.String("httpx-opts", "-status-code -title -tech-detect -web-server", "extra flags passed to projectdiscovery httpx")
+		skipCloudF  = flag.Bool("skip-cloud", true, "drop open ports whose banner/title matches cloud/CDN providers (e.g. Microsoft-Azure-Application-Gateway)")
+		cloudF      = flag.String("cloud-patterns", "", "comma-separated keywords treated as cloud/CDN (default: microsoft,azure,amazon,aws,cloudfront,google,oracle,digitalocean,ovh,linode,hetzner,scaleway,vultr,cloudflare,akamai,fastly,incapsula,imperva,sucuri)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Web Port Scanner
@@ -123,6 +138,22 @@ Options:
 	if *localF && !scanClassA && !scanClassB && !scanClassC {
 		fmt.Fprintln(os.Stderr, "Error: -local requires at least one class range (-a, -b, or -c).")
 		os.Exit(1)
+	}
+
+	// Custom cloud/CDN filter keywords
+	if *cloudF != "" {
+		var pats []string
+		for _, p := range strings.Split(*cloudF, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				pats = append(pats, strings.ToLower(p))
+			}
+		}
+		if len(pats) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: -cloud-patterns is empty.")
+			os.Exit(1)
+		}
+		cloudPatterns = pats
 	}
 
 	targets := flag.Args()
@@ -216,6 +247,7 @@ Options:
 		timeout:          *timeoutF,
 		workers:          *workersF,
 		probe:            *probeF,
+		skipCloud:        *skipCloudF,
 		file:             file,
 		results:          make(chan Result, *queueF),
 		cancel:           make(chan struct{}),
@@ -247,14 +279,50 @@ Options:
 		},
 	}
 
-	// Result writer + URL collector
+	// Streaming projectdiscovery httpx: pipe open ports as they are found
+	var httpxIn io.WriteCloser
+	var httpxCmd *exec.Cmd
+	streamHTTPX := false
+	httpxBin := strings.ToLower(*httpxF)
+	if httpxBin != "off" && httpxBin != "false" {
+		if httpxBin == "auto" || httpxBin == "true" {
+			httpxBin = findPDHTTPX()
+		}
+		if httpxBin == "" {
+			fmt.Println("⚠️  ProjectDiscovery httpx not found in PATH; URLs will still be saved to <out>.urls.")
+		} else {
+			cmd := exec.Command(httpxBin, strings.Fields(*httpxOptsF)...)
+			var err error
+			httpxIn, err = cmd.StdinPipe()
+			if err == nil {
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				if err := cmd.Start(); err != nil {
+					fmt.Printf("⚠️  Could not start httpx: %v\n", err)
+					httpxIn = nil
+				} else {
+					httpxCmd = cmd
+					streamHTTPX = true
+					fmt.Printf("🔎 Streaming open ports to httpx (%s) as they are found...\n", httpxBin)
+				}
+			}
+		}
+	}
+
+	// Result writer + URL collector (streams to httpx immediately)
 	var resultWg sync.WaitGroup
 	var urls []string
 	var urlsMu sync.Mutex
+	var skipped int64
 	resultWg.Add(1)
 	go func() {
 		defer resultWg.Done()
 		for r := range s.results {
+			if s.skipCloud && matchesCloud(r) {
+				skipped++
+				fmt.Printf("⛔ [SKIP cloud] %s:%d server=%q\n", r.Target, r.Port, r.Server)
+				continue
+			}
 			line := r.String()
 			fmt.Println(line)
 			if s.file != nil {
@@ -267,6 +335,9 @@ Options:
 				urlsMu.Lock()
 				urls = append(urls, u)
 				urlsMu.Unlock()
+				if streamHTTPX {
+					fmt.Fprintln(httpxIn, u)
+				}
 			}
 		}
 	}()
@@ -303,37 +374,31 @@ scanLoop:
 	close(s.results)
 	resultWg.Wait()
 
+	// Close the httpx stream and wait for it to finish probing
+	if streamHTTPX && httpxCmd != nil {
+		if httpxIn != nil {
+			httpxIn.Close()
+		}
+		httpxCmd.Wait()
+	}
+
 	if s.file != nil {
-		footer := fmt.Sprintf("\n%s\nScan finished at: %s\nIPs scanned: %d\nOpen web ports found: %d\n",
-			strings.Repeat("=", 60), time.Now().Format("2006-01-02 15:04:05"), len(ips), s.open)
+		footer := fmt.Sprintf("\n%s\nScan finished at: %s\nIPs scanned: %d\nOpen web ports found: %d\nCloud/CDN ports skipped: %d\n",
+			strings.Repeat("=", 60), time.Now().Format("2006-01-02 15:04:05"), len(ips), s.open, skipped)
 		s.file.WriteString(footer)
 		s.file.Close()
 	}
-	fmt.Printf("\n✅ Scan complete! %d open web ports found across %d IPs. Results in %s\n", s.open, len(ips), outPath)
+	fmt.Printf("\n✅ Scan complete! %d open web ports found across %d IPs (%d skipped as cloud/CDN). Results in %s\n",
+		s.open, len(ips), skipped, outPath)
 
-	// Write URL list for httpx and optionally run projectdiscovery httpx
+	// Write the collected URL list for later use
 	if len(urls) > 0 {
 		urlFile := outPath + ".urls"
 		if err := os.WriteFile(urlFile, []byte(strings.Join(urls, "\n")+"\n"), 0644); err != nil {
 			fmt.Printf("⚠️  Could not write URL list: %v\n", err)
 		} else {
-			fmt.Printf("🌐 URL list for httpx: %s (%d URLs)\n", urlFile, len(urls))
+			fmt.Printf("🌐 URL list saved: %s (%d URLs)\n", urlFile, len(urls))
 		}
-
-		httpxBin := strings.ToLower(*httpxF)
-		if httpxBin != "off" && httpxBin != "false" {
-			if httpxBin == "auto" || httpxBin == "true" {
-				httpxBin = findPDHTTPX()
-			}
-			if httpxBin == "" {
-				fmt.Println("⚠️  ProjectDiscovery httpx not found in PATH; skipped. Use the .urls file or install httpx (github.com/projectdiscovery/httpx).")
-			} else {
-				fmt.Printf("🔎 Running httpx (%s) on %d URLs...\n", httpxBin, len(urls))
-				runHTTPX(httpxBin, urls, *httpxOptsF)
-			}
-		}
-	} else {
-		fmt.Println("ℹ️  No open ports found, nothing to hand to httpx.")
 	}
 }
 
@@ -350,7 +415,8 @@ func (s *scanner) worker(jobs <-chan scanJob, wg *sync.WaitGroup) {
 			s.open++
 			s.scanMu.Unlock()
 			found := Result{Target: j.ip, Port: j.port}
-			if s.probe {
+			// Probe banner when requested, or when cloud filtering needs the Server header
+			if s.probe || s.skipCloud {
 				found = s.probeBanner(j.ip, j.port)
 			}
 			s.results <- found
@@ -487,28 +553,19 @@ func isPythonScript(path string) bool {
 	return strings.Contains(strings.ToLower(string(buf[:n])), "python")
 }
 
-// runHTTPX pipes the discovered URLs into projectdiscovery httpx.
-func runHTTPX(bin string, urls []string, opts string) {
-	args := strings.Fields(opts)
-	cmd := exec.Command(bin, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		fmt.Printf("⚠️  Could not open stdin for httpx: %v\n", err)
-		return
+// matchesCloud reports whether a result's banner/title identifies it as a
+// cloud/CDN provider endpoint (e.g. Microsoft-Azure-Application-Gateway).
+func matchesCloud(r Result) bool {
+	hay := strings.ToLower(r.Server + " " + r.Title)
+	if hay == "" {
+		return false
 	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("⚠️  Could not start httpx: %v\n", err)
-		return
+	for _, p := range cloudPatterns {
+		if strings.Contains(hay, p) {
+			return true
+		}
 	}
-	for _, u := range urls {
-		fmt.Fprintln(stdin, u)
-	}
-	stdin.Close()
-	if err := cmd.Wait(); err != nil {
-		fmt.Printf("⚠️  httpx exited with: %v\n", err)
-	}
+	return false
 }
 
 func (s *scanner) progress(stop chan struct{}) {

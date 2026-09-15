@@ -89,7 +89,8 @@ Hey there, security enthusiasts! 👋 Welcome to my comprehensive collection of 
 - ⚙️ **Custom Ports**: `-ports` flag with ranges (`-ports 80,443,8000-8100`)
 - 🏎️ **Concurrent**: worker pool with tunable `-workers` and `-timeout`
 - 🔍 **Banner Probe**: `-banner` reports scheme, status, server and page title
-- 🔗 **httpx Integration**: found URLs are written to `<out>.urls` and piped into [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) by default (auto-detects `httpx`/`httpx-pd`/`httpx-toolkit`, skips the Python httpx client). Tune with `-httpx` and `-httpx-opts`
+- 🔗 **httpx Integration**: found URLs stream to [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) immediately as ports are discovered (auto-detects `httpx`/`httpx-pd`/`httpx-toolkit`, skips the Python httpx client). Tune with `-httpx` and `-httpx-opts`; a `<out>.urls` list is still saved
+- 🚫 **Cloud/CDN Filter**: `-skip-cloud` (default on) drops ports whose banner/title matches providers like `Microsoft-Azure-Application-Gateway`; customize with `-cloud-patterns`
 - 💾 **Real-time Logging**: timestamped results file
 
 **Usage Examples:**
